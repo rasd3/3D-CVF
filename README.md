@@ -1,3 +1,3 @@
 # 3D-CVF
 Camer + Lidar
-### We will update code soon
+### The code will be updated soon.
