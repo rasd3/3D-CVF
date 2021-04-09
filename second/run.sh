@@ -1,0 +1,2 @@
+# rsync -avz -e 'ssh -p 4799' --exclude='dataset' --exclude="logs*" --exclude='prev_logs' --exclude="*.pyc" --exclude='*.tckpt' --exclude='*.png' jhyoo@166.104.14.92:/home/jhyoo/jhyoo/3DOD/iou_15_second/new_iou/ /home/spalab/jskim/kitti_15_second/
+rsync -avz -e 'ssh -p 4799' --exclude='dataset' --exclude="logs*" --exclude='prev_logs' --exclude="*.pyc" --exclude='*.tckpt' --exclude='*.png' jhyoo@166.104.14.92:/home/jhyoo/jhyoo/3DOD/iou_15_second/new_iou/ /home/spalab/jhyoo/new_15_second/

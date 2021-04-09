@@ -1,0 +1,732 @@
+import os
+import pathlib
+import pickle
+import shutil
+import time
+from functools import partial
+import json 
+import fire
+import numpy as np
+import torch
+from google.protobuf import text_format
+from tensorboardX import SummaryWriter
+import torchvision
+import torchplus
+import second.data.kitti_common as kitti
+from second.builder import target_assigner_builder, voxel_builder
+from second.data.preprocess import merge_second_batch
+from second.protos import pipeline_pb2
+from second.pytorch.builder import (box_coder_builder, input_reader_builder,
+                                      lr_scheduler_builder, optimizer_builder,
+                                      second_builder,
+                                      second_2stage_builder)
+from second.utils.eval import get_coco_eval_result, get_official_eval_result
+from second.utils.progress_bar import ProgressBar
+from collections import OrderedDict
+import torch.distributed as dist
+# from apex.parallel import DistributedDataParallel as DDP
+import argparse
+import torch.nn as nn
+import torch.multiprocessing as mp
+
+def _get_pos_neg_loss(cls_loss, labels):
+    # cls_loss: [N, num_anchors, num_class]
+    # labels: [N, num_anchors]
+    batch_size = cls_loss.shape[0]
+    if cls_loss.shape[-1] == 1 or len(cls_loss.shape) == 2:
+        cls_pos_loss = (labels > 0).type_as(cls_loss) * cls_loss.view(
+            batch_size, -1)
+        cls_neg_loss = (labels == 0).type_as(cls_loss) * cls_loss.view(
+            batch_size, -1)
+        cls_pos_loss = cls_pos_loss.sum() / batch_size
+        cls_neg_loss = cls_neg_loss.sum() / batch_size
+    else:
+        cls_pos_loss = cls_loss[..., 1:].sum() / batch_size
+        cls_neg_loss = cls_loss[..., 0].sum() / batch_size
+    return cls_pos_loss, cls_neg_loss
+
+
+def _flat_nested_json_dict(json_dict, flatted, sep=".", start=""):
+    for k, v in json_dict.items():
+        if isinstance(v, dict):
+            _flat_nested_json_dict(v, flatted, sep, start + sep + k)
+        else:
+            flatted[start + sep + k] = v
+
+
+def flat_nested_json_dict(json_dict, sep=".") -> dict:
+    """flat a nested json-like dict. this function make shadow copy.
+    """
+    flatted = {}
+    for k, v in json_dict.items():
+        if isinstance(v, dict):
+            _flat_nested_json_dict(v, flatted, sep, k)
+        else:
+            flatted[k] = v
+    return flatted
+
+
+def example_convert_to_torch(example, dtype=torch.float32,
+                             device=None) -> dict:
+    # device = device or torch.device("cuda:0")
+    device = torch.cuda.current_device()
+    example_torch = {}
+    float_names = [
+        "voxels", "anchors", "reg_targets", "reg_weights", "bev_map", "rect",
+        "Trv2c", "P2", "f_view","idxs_norm"
+    ]
+
+    for k, v in example.items():
+        if k in float_names:
+            example_torch[k] = torch.tensor(v, dtype=torch.float32, device=device).to(dtype)
+        elif k in ["coordinates", "labels", "num_points"]:
+            example_torch[k] = torch.tensor(
+                v, dtype=torch.int32, device=device)
+        elif k in ["anchors_mask"]:
+            example_torch[k] = torch.tensor(
+                v, dtype=torch.uint8, device=device)
+        else:
+            example_torch[k] = v
+    return example_torch
+
+
+def parse():
+
+    parser = argparse.ArgumentParser(description='SECOND argparser')
+    parser.add_argument("--config_path",default="onestage/server_fusion.fhd.onestage.config", type=str)
+    parser.add_argument("--model_dir",default="multi_gpu_mod", type=str)
+    parser.add_argument("--use_fusion", default=True, type=bool)
+    parser.add_argument("--use_ft", default=False,type=bool)
+    parser.add_argument("--use_second_stage", default=False, type=bool)
+    parser.add_argument("--result_path", default=None,type=str)
+    parser.add_argument("--create_folder", default=False,type=bool)
+    parser.add_argument("--display_step", default=50,type=int)
+    parser.add_argument("--summary_step", default=5,type=int)
+    parser.add_argument("--local_rank", default=0,type=int)
+    parser.add_argument("--pickle_result", default=True,type=bool)
+    parser.add_argument("--patchs", default=None,type=bool)
+    parser.add_argument("--launcher", default='none',type=str)
+    parser.add_argument("--m_port", default=1111,type=int)
+
+    args = parser.parse_args()
+    return args
+
+
+
+def train():
+    """train a VoxelNet model specified by a config file.
+    """
+
+    global args
+    args = parse()
+    create_folder = args.create_folder
+    config_path = args.config_path
+    
+    model_dir = args.model_dir
+    use_fusion = args.use_fusion
+    use_ft = args.use_ft
+    use_second_stage = args.use_second_stage
+    result_path = args.result_path
+    display_step = args.display_step
+    summary_step = args.summary_step
+    local_rank = args.local_rank
+    pickle_result = args.pickle_result
+    patchs = args.patchs
+    # import pdb; pdb.set_trace()
+    if create_folder:
+        if pathlib.Path(model_dir).exists():
+            model_dir = torchplus.train.create_folder(model_dir)
+    patchs = patchs or []
+    model_dir = pathlib.Path(model_dir)
+    model_dir.mkdir(parents=True, exist_ok=True)
+    if result_path is None:
+        result_path = model_dir / 'results'
+    config_file_bkp = "pipeline.config"
+    config = pipeline_pb2.TrainEvalPipelineConfig()
+    with open(config_path, "r") as f:
+        proto_str = f.read()
+        text_format.Merge(proto_str, config)
+    for patch in patchs:
+        patch = "config." + patch 
+        exec(patch)
+    shutil.copyfile(config_path, str(model_dir / config_file_bkp))
+    input_cfg = config.train_input_reader
+    eval_input_cfg = config.eval_input_reader
+    model_cfg = config.model.second
+    train_cfg = config.train_config
+
+    ################ Apex multi-gpu setting ################
+    if mp.get_start_method(allow_none=True) is None:
+        mp.set_start_method('spawn')
+    num_gpus = torch.cuda.device_count()
+    torch.cuda.set_device(args.local_rank % num_gpus)
+    dist.init_process_group(
+        backend='nccl',
+        init_method='tcp://127.0.0.1:%d' % args.m_port,
+        rank=args.local_rank,
+        world_size=num_gpus
+    )
+    # assert batch_size % num_gpus == 0, 'Batch size should be matched with GPUS: (%d, %d)' % (batch_size, num_gpus)
+    # batch_size_each_gpu = batch_size // num_gpus
+    rank = dist.get_rank()
+
+    # args_gpu = args.local_rank
+    # torch.cuda.set_device(args_gpu)
+    # torch.distributed.init_process_group(backend='nccl', init_method='env://')
+
+    ########################################################
+
+
+    
+    ######################
+    # BUILD VOXEL GENERATOR
+    ######################
+    voxel_generator = voxel_builder.build(model_cfg.voxel_generator)
+    ######################
+    # BUILD TARGET ASSIGNER
+    ######################
+    bv_range = voxel_generator.point_cloud_range[[0, 1, 3, 4]]
+    box_coder = box_coder_builder.build(model_cfg.box_coder)
+    target_assigner_cfg = model_cfg.target_assigner
+    target_assigner = target_assigner_builder.build(target_assigner_cfg,
+                                                    bv_range, box_coder)
+    class_names = target_assigner.classes
+    ######################
+    # BUILD NET
+    ######################
+    center_limit_range = model_cfg.post_center_limit_range
+    if use_second_stage:
+        net = second_2stage_builder.build(model_cfg, voxel_generator, target_assigner)
+    else:
+        net = second_builder.build(model_cfg, voxel_generator, target_assigner)
+
+    net.cuda()
+    net.train()
+    net = nn.parallel.DistributedDataParallel(net, device_ids=[args.local_rank % torch.cuda.device_count()],find_unused_parameters=True)
+
+
+
+    # net = DDP(net, delay_allreduce=True)
+
+    if args.local_rank == 0:
+        print("num_trainable parameters:", len(list(net.parameters())))
+    # for n, p in net.named_parameters():
+    #     print(n, p.shape)
+    ######################
+    if use_second_stage:
+        if use_fusion:
+           pth_name = 'pre_weight/8020/voxelnet-35210.tckpt'
+        #    pth_name= 'logs/test/voxelnet-35210.tckpt'
+           if args.local_rank == 0:
+                for i in range(30):
+                    print('################## load Fusion First stage weight complete #######################')
+        else:
+            pth_name = 'pre_weight/first_stage/lidaronly/voxelnet-30950.tckpt'
+            if args.local_rank == 0:
+                for i in range(30):           
+                    print('################## load LiDAR Only First stage weight complete #######################')
+
+        res_pre_weights = torch.load(pth_name)
+        new_res_state_dict = OrderedDict()
+        model_dict = net.state_dict()
+        for k,v in res_pre_weights.items():
+            if 'global_step' not in k:
+                if 'dir' not in k:
+                    k = 'module.'+k
+                    new_res_state_dict[k] = v
+        # import pdb;  pdb.set_trace()
+        model_dict.update(new_res_state_dict)
+        net.load_state_dict(model_dict)
+
+        if use_fusion: # use_fusion:
+            fpn_depth = 18
+            pth_name = 'pre_weight/FPN'+str(fpn_depth)+'_retinanet_968.pth'
+            res_pre_weights = torch.load(pth_name)
+            new_res_state_dict = OrderedDict()
+            model_dict = net.state_dict()
+            for k,v in res_pre_weights['state_dict'].items():
+                if ('regressionModel' not in k) and ('classificationModel' not in k):
+                    name = k.replace('module', 'rpn')
+                    new_res_state_dict[name] = v
+            model_dict.update(new_res_state_dict) 
+            net.load_state_dict(model_dict)
+            for i in range(30):
+                print('!!!!!!!!!!!!!!!!!! load FPN'+str(fpn_depth)+' weight complete !!!!!!!!!!!!!!!!!!')
+
+    ############ load FPN18 pre-weight #############
+    if use_fusion and not use_second_stage:
+        fpn_depth = 18
+        pth_name = 'pre_weight/FPN'+str(fpn_depth)+'_retinanet_968.pth'
+        res_pre_weights = torch.load(pth_name)
+        new_res_state_dict = OrderedDict()
+        model_dict = net.module.state_dict()
+        for k,v in res_pre_weights['state_dict'].items():
+            if ('regressionModel' not in k) and ('classificationModel' not in k):
+                name = k.replace('module', 'rpn')
+                new_res_state_dict[name] = v
+        model_dict.update(new_res_state_dict) 
+        net.module.load_state_dict(model_dict)
+        if args.local_rank == 0:
+            for i in range(30):
+                print('!!!!!!!!!!!!!!!!!! load FPN'+str(fpn_depth)+' weight complete !!!!!!!!!!!!!!!!!!')
+    ################################################
+    # BUILD OPTIMIZER
+    ######################
+    # we need global_step to create lr_scheduler, so restore net first.
+    # import pdb; pdb.set_trace()
+    torchplus.train.try_restore_latest_checkpoints(model_dir, [net.module])
+
+    gstep = net.module.get_global_step() - 1
+    optimizer_cfg = train_cfg.optimizer
+    if train_cfg.enable_mixed_precision:
+        net.half()
+        net.metrics_to_float()
+        net.convert_norm_to_float(net)
+    loss_scale = train_cfg.loss_scale_factor
+    mixed_optimizer = optimizer_builder.build(optimizer_cfg, net, mixed=train_cfg.enable_mixed_precision, loss_scale=loss_scale)
+    optimizer = mixed_optimizer
+    """
+    if train_cfg.enable_mixed_precision:
+        mixed_optimizer = torchplus.train.MixedPrecisionWrapper(
+            optimizer, loss_scale)
+    else:
+        mixed_optimizer = optimizer
+    """
+    # must restore optimizer AFTER using MixedPrecisionWrapper
+    torchplus.train.try_restore_latest_checkpoints(model_dir,
+                                                   [mixed_optimizer])
+    lr_scheduler = lr_scheduler_builder.build(optimizer_cfg, optimizer, train_cfg.steps)
+    if train_cfg.enable_mixed_precision:
+        float_dtype = torch.float16
+    else:
+        float_dtype = torch.float32
+    ######################
+    # PREPARE INPUT
+    ######################
+
+    dataset = input_reader_builder.build(
+        input_cfg,
+        model_cfg,
+        training=True,
+        voxel_generator=voxel_generator,
+        target_assigner=target_assigner)
+    eval_dataset = input_reader_builder.build(
+        eval_input_cfg,
+        model_cfg,
+        training=False,
+        voxel_generator=voxel_generator,
+        target_assigner=target_assigner)
+
+    def _worker_init_fn(worker_id):
+        time_seed = np.array(time.time(), dtype=np.int32)
+        np.random.seed(time_seed + worker_id)
+        print(f"WORKER {worker_id} seed:", np.random.get_state()[1][0])
+
+    sampler = torch.utils.data.distributed.DistributedSampler(dataset)
+
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=input_cfg.batch_size,
+        shuffle=False,
+        num_workers=input_cfg.num_workers,
+        pin_memory=False,
+        collate_fn=merge_second_batch,
+        worker_init_fn=_worker_init_fn,
+        sampler=sampler)
+
+    eval_sampler = torch.utils.data.distributed.DistributedSampler(eval_dataset)
+
+    eval_dataloader = torch.utils.data.DataLoader(
+        eval_dataset,
+        batch_size=eval_input_cfg.batch_size,
+        shuffle=False,
+        num_workers=eval_input_cfg.num_workers,
+        pin_memory=False,
+        collate_fn=merge_second_batch,
+        sampler=eval_sampler)
+
+    
+    data_iter = iter(dataloader)
+    print(len(dataloader))
+    # import pdb; pdb.set_trace()
+
+    ######################
+    # TRAINING
+    ######################
+    training_detail = []
+    log_path = model_dir / 'log.txt'
+    training_detail_path = model_dir / 'log.json'
+    if training_detail_path.exists():
+        with open(training_detail_path, 'r') as f:
+            training_detail = json.load(f)
+    logf = open(log_path, 'a')
+    logf.write(proto_str)
+    logf.write("\n")
+    summary_dir = model_dir / 'summary'
+    summary_dir.mkdir(parents=True, exist_ok=True)
+    if args.local_rank == 0:
+        writer = SummaryWriter(str(summary_dir))
+    else:
+        writer = None
+
+    total_step_elapsed = 0
+    remain_steps = train_cfg.steps - net.module.get_global_step()
+    t = time.time()
+    ckpt_start_time = t
+
+    total_loop = train_cfg.steps // train_cfg.steps_per_eval + 1
+    # total_loop = remain_steps // train_cfg.steps_per_eval + 1
+    clear_metrics_every_epoch = train_cfg.clear_metrics_every_epoch
+
+    if train_cfg.steps % train_cfg.steps_per_eval == 0:
+        total_loop -= 1
+    mixed_optimizer.zero_grad()
+    try:
+        for _ in range(total_loop):
+            if total_step_elapsed + train_cfg.steps_per_eval > train_cfg.steps:
+                steps = train_cfg.steps % train_cfg.steps_per_eval
+            else:
+                steps = train_cfg.steps_per_eval
+            for step in range(steps):
+                lr_scheduler.step(net.module.get_global_step())
+                try:
+                    example = next(data_iter)
+                except StopIteration:
+                    print("end epoch")
+                    if clear_metrics_every_epoch:
+                        net.module.clear_metrics()
+                    data_iter = iter(dataloader)
+                    example = next(data_iter)
+                example_torch = example_convert_to_torch(example, float_dtype)
+
+                batch_size = example["anchors"].shape[0]
+
+                ret_dict = net(example_torch)
+
+                # box_preds = ret_dict["box_preds"]
+                cls_preds = ret_dict["cls_preds"]
+                loss = ret_dict["loss"].mean()
+                cls_loss_reduced = ret_dict["cls_loss_reduced"].mean()
+                loc_loss_reduced = ret_dict["loc_loss_reduced"].mean()
+                cls_pos_loss = ret_dict["cls_pos_loss"]
+                cls_neg_loss = ret_dict["cls_neg_loss"]
+                loc_loss = ret_dict["loc_loss"]
+                cls_loss = ret_dict["cls_loss"]
+                # dir_loss_reduced = ret_dict["dir_loss_reduced"]
+                cared = ret_dict["cared"]
+                # labels = example_torch["labels"]
+                if use_second_stage:
+                    labels = ret_dict["labels"]
+                else:
+                    labels = example_torch["labels"]
+                if train_cfg.enable_mixed_precision:
+                    loss *= loss_scale
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(net.parameters(), 10.0)
+                mixed_optimizer.step()
+                mixed_optimizer.zero_grad()
+                net.module.update_global_step()
+                net_metrics = net.module.update_metrics(cls_loss_reduced,
+                                                 loc_loss_reduced, cls_preds,
+                                                 labels, cared)
+
+                step_time = (time.time() - t)
+                t = time.time()
+                metrics = {}
+                num_pos = int((labels > 0)[0].float().sum().cpu().numpy())
+                num_neg = int((labels == 0)[0].float().sum().cpu().numpy())
+                if 'anchors_mask' not in example_torch:
+                    num_anchors = example_torch['anchors'].shape[1]
+                else:
+                    num_anchors = int(example_torch['anchors_mask'][0].sum())
+                global_step = net.module.get_global_step()
+
+                # if global_step % display_step == 0:
+                if (writer is not None) and (global_step % display_step == 0):
+                    loc_loss_elem = [
+                        float(loc_loss[:, :, i].sum().detach().cpu().numpy() /
+                            batch_size) for i in range(loc_loss.shape[-1])
+                    ]
+                    metrics["type"] = "step_info"
+                    metrics["step"] = global_step
+                    metrics["steptime"] = step_time
+                    metrics.update(net_metrics)
+                    metrics["loss"] = {}
+                    metrics["loss"]["loc_elem"] = loc_loss_elem
+                    metrics["loss"]["cls_pos_rt"] = float(
+                        cls_pos_loss.detach().cpu().numpy())
+                    metrics["loss"]["cls_neg_rt"] = float(
+                        cls_neg_loss.detach().cpu().numpy())
+                    if model_cfg.use_direction_classifier:
+                        metrics["loss"]["dir_rt"] = float(
+                            dir_loss_reduced.detach().cpu().numpy())
+                    metrics["num_vox"] = int(example_torch["voxels"].shape[0])
+                    metrics["num_pos"] = int(num_pos)
+                    metrics["num_neg"] = int(num_neg)
+                    metrics["num_anchors"] = int(num_anchors)
+                    # metrics["lr"] = float(
+                    #     mixed_optimizer.param_groups[0]['lr'])
+                    metrics["lr"] = float(
+                        optimizer.lr)
+
+                    metrics["image_idx"] = example['image_idx'][0]
+                    training_detail.append(metrics)
+                    flatted_metrics = flat_nested_json_dict(metrics)
+                    flatted_summarys = flat_nested_json_dict(metrics, "/")
+                    for k, v in flatted_summarys.items():
+                        if isinstance(v, (list, tuple)):
+                            v = {str(i): e for i, e in enumerate(v)}
+                            if type(v) != str and ('loc_elem' not in k):
+                                writer.add_scalars(k, v, global_step)
+                        else:
+                            if (type(v) != str) and ('loc_elem' not in k):
+                                writer.add_scalar(k, v, global_step)
+                    metrics_str_list = []
+                    for k, v in flatted_metrics.items():
+                        if isinstance(v, float):
+                            metrics_str_list.append(f"{k}={v:.3}")
+                        elif isinstance(v, (list, tuple)):
+                            if v and isinstance(v[0], float):
+                                v_str = ', '.join([f"{e:.3}" for e in v])
+                                metrics_str_list.append(f"{k}=[{v_str}]")
+                            else:
+                                metrics_str_list.append(f"{k}={v}")
+                        else:
+                            metrics_str_list.append(f"{k}={v}")
+                    log_str = ', '.join(metrics_str_list)
+                    print(log_str, file=logf)
+                    print(log_str)
+
+                    ckpt_elasped_time = time.time() - ckpt_start_time
+                    if ckpt_elasped_time > train_cfg.save_checkpoints_secs:
+                        if writer is not None:
+                            torchplus.train.save_models(model_dir, [net.module, optimizer], net.module.get_global_step())
+
+                    ckpt_start_time = time.time()
+            total_step_elapsed += steps
+            if writer is not None:
+                to_cpu = True if isinstance(net, torch.nn.parallel.DistributedDataParallel) else False
+                # import pdb; pdb.set_trace()
+                torchplus.train.save_models(model_dir, [net.module, optimizer], net.module.get_global_step(), to_cpu=to_cpu)
+
+                net.eval()
+                with torch.no_grad():
+                    result_path_step = result_path / f"step_{net.module.get_global_step()}"
+                    result_path_step.mkdir(parents=True, exist_ok=True)
+                    print("#################################")
+                    print("#################################", file=logf)
+                    print("# EVAL")
+                    print("# EVAL", file=logf)
+                    print("#################################")
+                    print("#################################", file=logf)
+                    print("Generate output labels...")
+                    print("Generate output labels...", file=logf)
+                    t = time.time()
+                    dt_annos = []
+                    prog_bar = ProgressBar()
+                    net.module.clear_timer()
+                    prog_bar.start((len(eval_dataset) + eval_input_cfg.batch_size - 1) // eval_input_cfg.batch_size)
+                    for example in iter(eval_dataloader):
+                        example = example_convert_to_torch(example, float_dtype)
+                        if pickle_result:
+                            dt_annos += predict_kitti_to_anno(
+                                net.module, example, class_names, center_limit_range,
+                                model_cfg.lidar_input)
+                        else:
+                            _predict_kitti_to_file(net.moudule, example, result_path_step,
+                                                class_names, center_limit_range,
+                                                model_cfg.lidar_input)
+                        prog_bar.print_bar()
+
+                    sec_per_ex = len(eval_dataset) / (time.time() - t)
+                    print(f'generate label finished({sec_per_ex:.2f}/s). start eval:')
+                    print(f'generate label finished({sec_per_ex:.2f}/s). start eval:',
+                        file=logf)
+                    gt_annos = [
+                        info["annos"] for info in eval_dataset.dataset.kitti_infos
+                    ]
+                    if not pickle_result:
+                        dt_annos = kitti.get_label_annos(result_path_step)
+                    # result = get_official_eval_result_v2(gt_annos, dt_annos, class_names)
+                    # print(json.dumps(result, indent=2), file=logf)
+                    # if writer is not None:
+                    result = get_official_eval_result(gt_annos, dt_annos, class_names)
+                    print(result, file=logf)
+                    print(result)
+                    result_1 = result.split("\n")[:5]
+                    result_2 = result.split("\n")[10:15]
+                    result_3 = result.split("\n")[20:25]
+                    emh = ['0_easy', '1_mod', '2_hard']
+                    result_save = result_1
+                    for i in range(len(result_save)-1):
+                        save_targ = result_save[i+1]
+                        name_val = save_targ.split(':')[0].split(' ')[0]
+                        value_val = save_targ.split(':')[1:]
+                        for ev in range(3):
+                            each_val = value_val[0].split(',')[ev]
+                            merge_txt = 'AP_kitti/car_70/' + name_val+'/'+emh[ev]
+                            writer.add_scalar(merge_txt, float(each_val), global_step)
+                    if pickle_result:
+                        with open(result_path_step / "result.pkl", 'wb') as f:
+                            pickle.dump(dt_annos, f)
+                    writer.add_text('eval_result', result, global_step)
+                net.train()
+    except Exception as e:
+        if writer is not None:
+            to_cpu = True if isinstance(net, torch.nn.parallel.DistributedDataParallel) else False
+            torchplus.train.save_models(model_dir, [net, optimizer],
+                                        net.module.get_global_step(), to_cpu=to_cpu)
+        logf.close()
+        raise e
+    # save model before exit
+    if writer is not None:
+        to_cpu = True if isinstance(net, torch.nn.parallel.DistributedDataParallel) else False
+        torchplus.train.save_models(model_dir, [net, optimizer],
+                                    net.module.get_global_step(),to_cpu=to_cpu)
+    logf.close()
+
+
+def _predict_kitti_to_file(net,
+                           example,
+                           result_save_path,
+                           class_names,
+                           center_limit_range=None,
+                           lidar_input=False):
+    batch_image_shape = example['image_shape']
+    batch_imgidx = example['image_idx']
+    predictions_dicts = net(example)
+    # t = time.time()
+    for i, preds_dict in enumerate(predictions_dicts):
+        image_shape = batch_image_shape[i]
+        img_idx = preds_dict["image_idx"]
+        if preds_dict["bbox"] is not None or preds_dict["bbox"].size.numel():
+            box_2d_preds = preds_dict["bbox"].data.cpu().numpy()
+            box_preds = preds_dict["box3d_camera"].data.cpu().numpy()
+            scores = preds_dict["scores"].data.cpu().numpy()
+            box_preds_lidar = preds_dict["box3d_lidar"].data.cpu().numpy()
+            # write pred to file
+            box_preds = box_preds[:, [0, 1, 2, 4, 5, 3,
+                                      6]]  # lhw->hwl(label file format)
+            label_preds = preds_dict["label_preds"].data.cpu().numpy()
+            # label_preds = np.zeros([box_2d_preds.shape[0]], dtype=np.int32)
+            result_lines = []
+            for box, box_lidar, bbox, score, label in zip(
+                    box_preds, box_preds_lidar, box_2d_preds, scores,
+                    label_preds):
+                if not lidar_input:
+                    if bbox[0] > image_shape[1] or bbox[1] > image_shape[0]:
+                        continue
+                    if bbox[2] < 0 or bbox[3] < 0:
+                        continue
+                # print(img_shape)
+                if center_limit_range is not None:
+                    limit_range = np.array(center_limit_range)
+                    if (np.any(box_lidar[:3] < limit_range[:3])
+                            or np.any(box_lidar[:3] > limit_range[3:])):
+                        continue
+                bbox[2:] = np.minimum(bbox[2:], image_shape[::-1])
+                bbox[:2] = np.maximum(bbox[:2], [0, 0])
+                result_dict = {
+                    'name': class_names[int(label)],
+                    'alpha': -np.arctan2(-box_lidar[1], box_lidar[0]) + box[6],
+                    'bbox': bbox,
+                    'location': box[:3],
+                    'dimensions': box[3:6],
+                    'rotation_y': box[6],
+                    'score': score,
+                }
+                result_line = kitti.kitti_result_line(result_dict)
+                result_lines.append(result_line)
+        else:
+            result_lines = []
+        result_file = f"{result_save_path}/{kitti.get_image_index_str(img_idx)}.txt"
+        result_str = '\n'.join(result_lines)
+        with open(result_file, 'w') as f:
+            f.write(result_str)
+
+
+def predict_kitti_to_anno(net,
+                          example,
+                          class_names,
+                          center_limit_range=None,
+                          lidar_input=False,
+                          global_set=None):
+    batch_image_shape = example['image_shape']
+    batch_imgidx = example['image_idx']
+    predictions_dicts = net(example)
+    # t = time.time()
+    annos = []
+    for i, preds_dict in enumerate(predictions_dicts):
+        image_shape = batch_image_shape[i]
+        img_idx = preds_dict["image_idx"]
+        if preds_dict["bbox"] is not None or preds_dict["bbox"].size.numel() != 0:
+            box_2d_preds = preds_dict["bbox"].detach().cpu().numpy()
+            box_preds = preds_dict["box3d_camera"].detach().cpu().numpy()
+            scores = preds_dict["scores"].detach().cpu().numpy()
+            box_preds_lidar = preds_dict["box3d_lidar"].detach().cpu().numpy()
+            # write pred to file
+            label_preds = preds_dict["label_preds"].detach().cpu().numpy()
+            # label_preds = np.zeros([box_2d_preds.shape[0]], dtype=np.int32)
+            anno = kitti.get_start_result_anno()
+            num_example = 0
+            for box, box_lidar, bbox, score, label in zip(
+                    box_preds, box_preds_lidar, box_2d_preds, scores,
+                    label_preds):
+                if not lidar_input:
+                    if bbox[0] > image_shape[1] or bbox[1] > image_shape[0]:
+                        continue
+                    if bbox[2] < 0 or bbox[3] < 0:
+                        continue
+                # print(img_shape)
+                if center_limit_range is not None:
+                    limit_range = np.array(center_limit_range)
+                    if (np.any(box_lidar[:3] < limit_range[:3])
+                            or np.any(box_lidar[:3] > limit_range[3:])):
+                        continue
+                bbox[2:] = np.minimum(bbox[2:], image_shape[::-1])
+                bbox[:2] = np.maximum(bbox[:2], [0, 0])
+                anno["name"].append(class_names[int(label)])
+                anno["truncated"].append(0.0)
+                anno["occluded"].append(0)
+                anno["alpha"].append(-np.arctan2(-box_lidar[1], box_lidar[0]) +
+                                     box[6])
+                anno["bbox"].append(bbox)
+                anno["dimensions"].append(box[3:6])
+                anno["location"].append(box[:3])
+                anno["rotation_y"].append(box[6])
+                if global_set is not None:
+                    for i in range(100000):
+                        if score in global_set:
+                            score -= 1 / 100000
+                        else:
+                            global_set.add(score)
+                            break
+                anno["score"].append(score)
+
+                num_example += 1
+            if num_example != 0:
+                anno = {n: np.stack(v) for n, v in anno.items()}
+                annos.append(anno)
+            else:
+                annos.append(kitti.empty_result_anno())
+        else:
+            annos.append(kitti.empty_result_anno())
+        num_example = annos[-1]["name"].shape[0]
+        annos[-1]["image_idx"] = np.array(
+            [img_idx] * num_example, dtype=np.int64)
+    return annos
+
+
+def save_config(config_path, save_path):
+    config = pipeline_pb2.TrainEvalPipelineConfig()
+    with open(config_path, "r") as f:
+        proto_str = f.read()
+        text_format.Merge(proto_str, config)
+    ret = text_format.MessageToString(config, indent=2)
+    with open(save_path, 'w') as f:
+        f.write(ret)
+
+
+if __name__ == '__main__':
+    # fire.Fire()
+    train()

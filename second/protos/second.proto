@@ -1,0 +1,77 @@
+syntax = "proto3";
+
+package second.protos;
+import "second/protos/losses.proto";
+import "second/protos/box_coder.proto";
+import "second/protos/target.proto";
+import "second/protos/voxel_generator.proto";
+
+message VoxelNet {
+  VoxelGenerator voxel_generator = 1;
+  message VoxelFeatureExtractor {
+    string module_class_name = 1;
+    repeated uint32 num_filters = 2;
+    bool with_distance = 3;
+    uint32 num_input_features = 4;
+  }
+  VoxelFeatureExtractor voxel_feature_extractor = 2;
+  message MiddleFeatureExtractor {
+    string module_class_name = 1;
+    repeated uint32 num_filters_down1 = 2;
+    repeated uint32 num_filters_down2 = 3;
+    uint32 num_input_features = 4;
+    uint32 downsample_factor = 5;
+  }
+  MiddleFeatureExtractor middle_feature_extractor = 3;
+  message RPN {
+    string module_class_name = 1;
+    repeated uint32 layer_nums = 2;
+    repeated uint32 layer_strides = 3;
+    repeated uint32 num_filters = 4;
+    repeated uint32 upsample_strides = 5;
+    repeated uint32 num_upsample_filters = 6;
+    bool use_groupnorm = 7;
+    uint32 num_groups = 8;
+    uint32 num_input_features = 9;
+  }
+  RPN rpn = 4;
+  // IOU
+  message IOU {
+    string module_class_name = 1;
+    repeated int32 num_filters = 2;
+    int32 num_input_features = 3;
+  }
+  bool use_iou_branch = 5;
+  IOU iou = 6;
+  //////
+  bool use_sigmoid_score = 7;
+  Loss loss = 8;
+  bool encode_rad_error_by_sin = 9;
+  bool encode_background_as_zeros = 10;
+  bool use_aux_classifier = 11;
+  bool use_rotate_nms = 12;
+  bool use_multi_class_nms = 13;
+  uint32 nms_pre_max_size = 14;
+  uint32 nms_post_max_size = 15;
+  float nms_score_threshold = 16;
+  float nms_iou_threshold = 17;
+  repeated float post_center_limit_range = 18;
+  bool use_direction_classifier = 19;
+  float direction_loss_weight = 20;
+  float pos_class_weight = 21;
+  float neg_class_weight = 22;
+  enum LossNormType {
+    NormByNumExamples = 0;
+    NormByNumPositives = 1;
+    NormByNumPosNeg = 2;
+  }
+  LossNormType loss_norm_type = 23;
+  bool use_bev = 24;
+  bool without_reflectivity = 25;
+  bool encode_angle_to_vector = 26;
+  BoxCoder box_coder = 27;
+  TargetAssigner target_assigner = 28;
+  bool lidar_input = 29;
+  uint32 num_point_features = 30;
+  
+}
