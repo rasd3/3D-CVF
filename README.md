@@ -11,11 +11,18 @@ docker pull yckimm/second:second_v1.5
 
 ## Getting Started
 
-### Training
+### Training (1st stage)
 
 ```
-sh train_bash.sh
+sh train_bash_1st.sh
 ```
+
+### Training (2nd stage)
+
+```
+sh train_bash_2nd.sh
+```
+
 
 
 ## Acknowledge

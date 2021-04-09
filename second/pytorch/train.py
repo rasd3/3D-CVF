@@ -146,11 +146,7 @@ def train(config_path,
     net.cuda()
     print("num_trainable parameters:", len(list(net.parameters())))
 
-    ######################
-    if use_second_stage:
-        pth_name = 'pre_weight/first_stage/fusion_split/voxelnet-35210.tckpt'
-        for i in range(30):
-            print('################## load Fusion First stage weight complete #######################')
+
 
     ############ load FPN18 pre-weight #############
     if not use_second_stage:
@@ -167,7 +163,13 @@ def train(config_path,
         net.load_state_dict(model_dict)
         for i in range(30):
             print('!!!!!!!!!!!!!!!!!! load FPN'+str(fpn_depth)+' weight complete !!!!!!!!!!!!!!!!!!')
-    ################################################
+    ######################
+    if use_second_stage:
+        pth_name = 'pre_weight/first_stage/fusion_split/voxelnet-35210.tckpt'
+        for i in range(30):
+            print('################## load Fusion First stage weight complete #######################')
+            
+    #####################
     # BUILD OPTIMIZER
     #####################
     # we need global_step to create lr_scheduler, so restore net first.
