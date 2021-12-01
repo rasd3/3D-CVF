@@ -363,6 +363,80 @@ class RPN_FUSION(nn.Module):
             self.f_in_planes_det = planes * block.expansion
         return nn.Sequential(*layers)
 
+    def feature_crop_interp(self, feature, idx_c, w_size=200,h_size=176):
+       '''Auto-Calibrated projection'''
+       grid_num = 2
+       num_coord = idx_c.shape[1]
+       a1 = torch.tensor([[-0.5,-0.5], [-0.5,0.5], [0.5,-0.5], [0.5, 0.5]]).cuda()
+
+       batch_size = feature.shape[0]
+       f_w, f_h = feature.shape[2], feature.shape[3]
+       crop_feature_all = []
+
+       for i in range(idx_c.shape[0]):
+           idx = idx_c[i]
+           mask_ori = torch.mul(idx >= 0, idx <= 1).sum(dim=1) != 2
+           idx[mask_ori] = 0
+           idx_upsamp = idx*torch.tensor([f_w,f_h]).view(1,2).cuda().to(torch.float32)
+           mask_w = torch.mul(idx_upsamp[:,0] >= 0, idx_upsamp[:,0] < w_size)
+           mask_h = torch.mul(idx_upsamp[:,1] >= 0, idx_upsamp[:,1] < h_size)
+           mask_wh = torch.stack((mask_w,mask_h), dim=1)
+           idx_upsamp = idx_upsamp * mask_wh.cuda().to(torch.float)
+           rep_coord = idx_upsamp.repeat_interleave(grid_num**2,dim=0)
+           rep_a1 = a1.repeat(num_coord,1).cuda()
+           c_coord = torch.floor(rep_coord+rep_a1) ## minus debug!
+
+           cen_coord = c_coord+0.5
+           rep_mask = mask_ori.repeat_interleave(grid_num**2, dim=0)
+           w_coord = ((cen_coord-rep_coord)**2).sum(1).sqrt()
+           w_norm = w_coord[0::4] + w_coord[1::4] + w_coord[2::4] + w_coord[3::4]
+           w_norm = w_norm.repeat_interleave(grid_num**2,dim=0)
+           w_coord = w_coord/w_norm
+           w_coord[rep_mask] = 0
+           c_coord[rep_mask,:] = 0
+           mask = torch.mul(c_coord[:,0] >= 0, c_coord[:,0] < f_w) + torch.mul(c_coord[:,1] >= 0, c_coord[:,1] < f_h) != 2
+           w_coord[mask] = 0
+           c_coord[mask, :] = 0
+
+           #########################################
+           feature_for_offset = feature[i,:,c_coord[:,0].to(torch.int64), c_coord[:,1].to(torch.int64)] * w_coord.view(1,num_coord*grid_num**2)
+           self.off_input = feature_for_offset.permute(1,0)
+           self.off_input = self.off_input.view(35200, 4, 256).contiguous()
+           self.off_input = self.off_input.view(35200, 1024).contiguous()
+           self.off_input = self.idx_linear(self.off_input)
+
+           idx_upsamp = idx_upsamp + self.off_input
+           mask_w = torch.mul(idx_upsamp[:,0] >= 0, idx_upsamp[:,0] < w_size)
+           mask_h = torch.mul(idx_upsamp[:,1] >= 0, idx_upsamp[:,1] < h_size)
+           mask_wh = torch.stack((mask_w,mask_h), dim=1)
+           idx_upsamp = idx_upsamp * mask_wh.cuda().to(torch.float)
+           rep_coord = idx_upsamp.repeat_interleave(grid_num**2,dim=0)
+           #########################################
+
+           w_coord = ((cen_coord-rep_coord)**2).sum(1).sqrt()
+           w_norm = w_coord[0::4] + w_coord[1::4] + w_coord[2::4] + w_coord[3::4]
+           w_norm = w_norm.repeat_interleave(grid_num**2,dim=0)
+           w_coord = w_coord/w_norm
+           w_coord[rep_mask] = 0
+           c_coord[rep_mask,:] = 0
+           mask = torch.mul(c_coord[:,0] >= 0, c_coord[:,0] < f_w) + torch.mul(c_coord[:,1] >= 0, c_coord[:,1] < f_h) != 2
+           w_coord[mask] = 0
+           c_coord[mask, :] = 0
+
+           temp = feature[i,:,c_coord[:,0].to(torch.int64), c_coord[:,1].to(torch.int64)] * w_coord.view(1,num_coord*grid_num**2)
+           # off_input = temp.permute(1,0)
+           # off_input = off_input.view(35200, 4, 256)
+           # off_input = off_input.view(35200, 1024)
+
+
+           crop_feature_each = temp[:,0::4] + temp[:,1::4] + temp[:,2::4] + temp[:,3::4]
+           crop_feature_all.append(crop_feature_each)
+           # crop_feature1[i,:,:] = feature[i,:,c_coord[:,0].to(torch.int64), c_coord[:,1].to(torch.int64)] * w_coord.view(1,num_coord*grid_num**2)
+           # crop_feature[i,:,:] = crop_feature1[i,:,:][:,0::4] + crop_feature1[i,:,:][:,1::4] + crop_feature1[i,:,:][:,2::4] + crop_feature1[i,:,:][:,3::4]
+       crop_feature = torch.stack(crop_feature_all,dim=0)
+       crop_features_cc = crop_feature.reshape(batch_size, -1, w_size, h_size)
+       return crop_features_cc
+
     def forward(self, x, f_view, idxs_norm, bev=None):
 
         ups = []
@@ -374,7 +448,6 @@ class RPN_FUSION(nn.Module):
         else:
             x = ups[0]
         ###################### FPN-18 ##########################
-        # with torch.no_grad():
         bev_feature = x
         f1 = self.maxpool(F.relu(self.bn1(self.conv1(f_view))))
         f2 = self.layer1(f1)
@@ -392,7 +465,6 @@ class RPN_FUSION(nn.Module):
             # crop_feature_0 = self.feature_crop_interp(fuse_features, idxs_norm[:,i,:,:])
             crop_feature_all.append(crop_feature_0)
         #######################################################
-        # import pdb; pdb.set_trace()
         crop_feature_all = torch.stack(crop_feature_all, dim=2)
         N, C, D, H, W = crop_feature_all.shape
         crop_feature_all = crop_feature_all.view(N,C*D,H,W)
